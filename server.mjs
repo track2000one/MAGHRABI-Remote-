@@ -28,6 +28,8 @@ let latestFrame = null;
 let latestFrameAt = null;
 let sessionsToday = 0;
 let sessionsDate = new Date().toISOString().slice(0, 10);
+let inputSeq = 0;
+let inputQueue = [];
 const failedLogins = new Map();
 
 function json(res, status, payload, extraHeaders = {}) {
@@ -157,6 +159,60 @@ function clientIp(req) {
   return String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown").split(",")[0].trim();
 }
 
+function clearInputQueue() {
+  inputQueue = [];
+}
+
+function normalizeInputEvent(value) {
+  if (!value || typeof value !== "object") return null;
+  const type = String(value.type || "");
+
+  if (type === "move") {
+    const x = Number(value.x);
+    const y = Number(value.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) return null;
+    return { type, x: Math.round(x * 100000) / 100000, y: Math.round(y * 100000) / 100000 };
+  }
+
+  if (type === "button") {
+    const button = String(value.button || "");
+    const action = String(value.action || "");
+    if (!["left", "middle", "right"].includes(button) || !["down", "up"].includes(action)) return null;
+    return { type, button, action };
+  }
+
+  if (type === "wheel") {
+    const raw = Number(value.delta);
+    if (!Number.isFinite(raw)) return null;
+    const delta = Math.max(-1200, Math.min(1200, Math.trunc(raw)));
+    if (!delta) return null;
+    return { type, delta };
+  }
+
+  if (type === "key") {
+    const code = String(value.code || "");
+    const action = String(value.action || "");
+    if (!code || code.length > 32 || !/^[A-Za-z0-9]+$/.test(code) || !["down", "up"].includes(action)) return null;
+    return { type, code, action };
+  }
+
+  if (type === "release") return { type };
+  return null;
+}
+
+function enqueueInputEvents(events) {
+  for (const raw of events) {
+    const event = normalizeInputEvent(raw);
+    if (!event) continue;
+    inputSeq += 1;
+    inputQueue.push({ seq: inputSeq, ...event, createdAt: Date.now() });
+  }
+
+  if (inputQueue.length > 300) inputQueue = inputQueue.slice(-300);
+  const cutoff = Date.now() - 30_000;
+  inputQueue = inputQueue.filter((item) => item.createdAt >= cutoff);
+}
+
 function contentType(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   return {
@@ -211,6 +267,7 @@ const server = http.createServer(async (req, res) => {
       service: "MAGHRABI Remote",
       agentConfigured: Boolean(agentToken),
       ownerConfigured: Boolean(ownerPassword),
+      remoteControl: "V2.2",
     });
   }
 
@@ -248,6 +305,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === "POST" && url.pathname === "/api/auth/logout") {
+    viewerActiveUntil = 0;
+    clearInputQueue();
     return json(res, 200, { ok: true }, { "Set-Cookie": clearOwnerCookie() });
   }
 
@@ -276,9 +335,32 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && url.pathname === "/api/agent/session-state") {
     if (!requireAgent(req, res)) return;
+    const active = Date.now() < viewerActiveUntil;
     return json(res, 200, {
-      screenRequested: Date.now() < viewerActiveUntil,
+      screenRequested: active,
+      controlRequested: active,
       captureIntervalMs: 1200,
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/agent/commands") {
+    if (!requireAgent(req, res)) return;
+    const active = Date.now() < viewerActiveUntil;
+    const requestedAfter = Math.max(0, Number(url.searchParams.get("after") || 0) || 0);
+    const after = requestedAfter > inputSeq ? 0 : requestedAfter;
+
+    if (!active) {
+      clearInputQueue();
+      return json(res, 200, { active: false, controlRequested: false, latestSeq: inputSeq, commands: [] });
+    }
+
+    if (after > 0) inputQueue = inputQueue.filter((item) => item.seq > after);
+    const commands = inputQueue.filter((item) => item.seq > after).slice(0, 64).map(({ createdAt, ...item }) => item);
+    return json(res, 200, {
+      active: true,
+      controlRequested: true,
+      latestSeq: inputSeq,
+      commands,
     });
   }
 
@@ -306,8 +388,9 @@ const server = http.createServer(async (req, res) => {
     viewerActiveUntil = Date.now() + 25_000;
     latestFrame = null;
     latestFrameAt = null;
+    clearInputQueue();
     sessionsToday += 1;
-    return json(res, 200, { ok: true, mode: "view-only", expiresInSeconds: 25 });
+    return json(res, 200, { ok: true, mode: "control", expiresInSeconds: 25 });
   }
 
   if (req.method === "POST" && url.pathname === "/api/session/keepalive") {
@@ -316,11 +399,28 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true });
   }
 
+  if (req.method === "POST" && url.pathname === "/api/session/input") {
+    if (!requireOwner(req, res)) return;
+    if (Date.now() >= viewerActiveUntil) return json(res, 409, { ok: false, error: "No active control session" });
+    try {
+      const raw = await readBody(req, 24 * 1024);
+      const payload = JSON.parse(raw || "{}");
+      const events = Array.isArray(payload.events) ? payload.events.slice(0, 32) : [];
+      if (!events.length) return json(res, 400, { ok: false, error: "No input events" });
+      enqueueInputEvents(events);
+      viewerActiveUntil = Date.now() + 25_000;
+      return json(res, 200, { ok: true, latestSeq: inputSeq });
+    } catch {
+      return json(res, 400, { ok: false, error: "Invalid input payload" });
+    }
+  }
+
   if (req.method === "POST" && url.pathname === "/api/session/stop") {
     if (!requireOwner(req, res)) return;
     viewerActiveUntil = 0;
     latestFrame = null;
     latestFrameAt = null;
+    enqueueInputEvents([{ type: "release" }]);
     return json(res, 200, { ok: true });
   }
 
@@ -330,7 +430,8 @@ const server = http.createServer(async (req, res) => {
       active: Date.now() < viewerActiveUntil,
       frameAvailable: Boolean(latestFrame),
       frameAt: latestFrameAt,
-      mode: "view-only",
+      mode: "control",
+      inputQueueDepth: inputQueue.length,
     });
   }
 
@@ -360,4 +461,5 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`MAGHRABI Remote listening on 0.0.0.0:${port}`);
   console.log(`Agent authentication configured: ${Boolean(agentToken)}`);
   console.log(`Owner authentication configured: ${Boolean(ownerPassword)}`);
+  console.log("Remote input protocol: V2.2");
 });

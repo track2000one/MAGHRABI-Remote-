@@ -1,4 +1,12 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import {
+  FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+  WheelEvent as ReactWheelEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import "./remote.css";
 
 type Page = "dashboard" | "devices" | "sessions" | "security" | "settings";
@@ -16,6 +24,15 @@ type AuthStatus = {
   configured: boolean;
   authenticated: boolean;
 };
+
+type MouseButton = "left" | "middle" | "right";
+type InputAction = "down" | "up";
+type RemoteInputEvent =
+  | { type: "move"; x: number; y: number }
+  | { type: "button"; button: MouseButton; action: InputAction }
+  | { type: "wheel"; delta: number }
+  | { type: "key"; code: string; action: InputAction }
+  | { type: "release" };
 
 const labels: Record<Page, string> = {
   dashboard: "لوحة التحكم",
@@ -70,7 +87,7 @@ function LoginScreen({ configured, onLogin }: { configured: boolean; onLogin: ()
           <div className="auth-logo">M</div>
           <span className="auth-kicker">SECURITY SETUP REQUIRED</span>
           <h1>فعّل حماية المالك أولًا</h1>
-          <p>قبل عرض شاشة جهاز المنزل، أضف متغير البيئة التالي في Railway ثم انتظر إعادة النشر:</p>
+          <p>قبل التحكم بجهاز المنزل، أضف متغير البيئة التالي في Railway ثم انتظر إعادة النشر:</p>
           <code>MAGHRABI_OWNER_PASSWORD</code>
           <small>استخدم كلمة مرور قوية ومختلفة عن كلمة مرور Windows وRustDesk. لا تحفظها داخل GitHub.</small>
         </section>
@@ -107,7 +124,7 @@ function LoginScreen({ configured, onLogin }: { configured: boolean; onLogin: ()
         <div className="auth-logo">M</div>
         <span className="auth-kicker">MAGHRABI REMOTE</span>
         <h1>دخول مالك النظام</h1>
-        <p>تسجيل الدخول مطلوب قبل الوصول إلى حالة الجهاز أو شاشة HOME-PC.</p>
+        <p>تسجيل الدخول مطلوب قبل الوصول إلى HOME-PC أو إرسال أي إدخال عن بعد.</p>
         <label>
           <span>كلمة المرور</span>
           <input
@@ -132,7 +149,51 @@ function RemoteSession({ device, onClose }: { device: DeviceStatus; onClose: () 
   const [frameUrl, setFrameUrl] = useState<string | null>(null);
   const [message, setMessage] = useState("بانتظار أول صورة من Agent...");
   const [connected, setConnected] = useState(true);
+  const [controlFocused, setControlFocused] = useState(false);
   const screenRef = useRef<HTMLDivElement>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
+  const inputQueueRef = useRef<RemoteInputEvent[]>([]);
+  const pendingMoveRef = useRef<RemoteInputEvent | null>(null);
+  const flushingRef = useRef(false);
+
+  const enqueueInput = (event: RemoteInputEvent) => {
+    if (event.type === "move") {
+      pendingMoveRef.current = event;
+      return;
+    }
+
+    if (pendingMoveRef.current) {
+      inputQueueRef.current.push(pendingMoveRef.current);
+      pendingMoveRef.current = null;
+    }
+    inputQueueRef.current.push(event);
+    if (inputQueueRef.current.length > 96) inputQueueRef.current.splice(0, inputQueueRef.current.length - 96);
+  };
+
+  const flushInput = async () => {
+    if (flushingRef.current) return;
+    if (pendingMoveRef.current) {
+      inputQueueRef.current.push(pendingMoveRef.current);
+      pendingMoveRef.current = null;
+    }
+    if (!inputQueueRef.current.length) return;
+
+    const events = inputQueueRef.current.splice(0, 32);
+    flushingRef.current = true;
+    try {
+      const response = await fetch("/api/session/input", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ events }),
+        cache: "no-store",
+      });
+      if (response.status === 401 || response.status === 409) setConnected(false);
+    } catch {
+      setConnected(false);
+    } finally {
+      flushingRef.current = false;
+    }
+  };
 
   useEffect(() => {
     let active = true;
@@ -191,12 +252,107 @@ function RemoteSession({ device, onClose }: { device: DeviceStatus; onClose: () 
     };
   }, []);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => void flushInput(), 50);
+    return () => {
+      window.clearInterval(timer);
+      enqueueInput({ type: "release" });
+      void flushInput();
+    };
+  }, []);
+
   const fullscreen = async () => {
     try {
       await screenRef.current?.requestFullscreen();
+      screenRef.current?.focus({ preventScroll: true });
     } catch {
       // Browser may deny fullscreen when not initiated by the user.
     }
+  };
+
+  const pointerPosition = (clientX: number, clientY: number) => {
+    const container = screenRef.current;
+    const image = imageRef.current;
+    if (!container || !image || !image.naturalWidth || !image.naturalHeight) return null;
+
+    const rect = container.getBoundingClientRect();
+    const imageAspect = image.naturalWidth / image.naturalHeight;
+    let renderWidth = rect.width;
+    let renderHeight = renderWidth / imageAspect;
+    if (renderHeight > rect.height) {
+      renderHeight = rect.height;
+      renderWidth = renderHeight * imageAspect;
+    }
+
+    const left = rect.left + (rect.width - renderWidth) / 2;
+    const top = rect.top + (rect.height - renderHeight) / 2;
+    if (clientX < left || clientX > left + renderWidth || clientY < top || clientY > top + renderHeight) return null;
+
+    return {
+      x: Math.max(0, Math.min(1, (clientX - left) / renderWidth)),
+      y: Math.max(0, Math.min(1, (clientY - top) / renderHeight)),
+    };
+  };
+
+  const queuePointerMove = (clientX: number, clientY: number) => {
+    const point = pointerPosition(clientX, clientY);
+    if (point) enqueueInput({ type: "move", ...point });
+    return point;
+  };
+
+  const buttonName = (button: number): MouseButton | null => {
+    if (button === 0) return "left";
+    if (button === 1) return "middle";
+    if (button === 2) return "right";
+    return null;
+  };
+
+  const handlePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    queuePointerMove(event.clientX, event.clientY);
+  };
+
+  const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.currentTarget.focus({ preventScroll: true });
+    try { event.currentTarget.setPointerCapture(event.pointerId); } catch { /* ignored */ }
+    queuePointerMove(event.clientX, event.clientY);
+    const button = buttonName(event.button);
+    if (button) enqueueInput({ type: "button", button, action: "down" });
+  };
+
+  const handlePointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    queuePointerMove(event.clientX, event.clientY);
+    const button = buttonName(event.button);
+    if (button) enqueueInput({ type: "button", button, action: "up" });
+    try { event.currentTarget.releasePointerCapture(event.pointerId); } catch { /* ignored */ }
+  };
+
+  const handleWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    queuePointerMove(event.clientX, event.clientY);
+    const delta = event.deltaY === 0 ? 0 : Math.sign(-event.deltaY) * 120;
+    if (delta) enqueueInput({ type: "wheel", delta });
+  };
+
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.isComposing || !event.code) return;
+    event.preventDefault();
+    event.stopPropagation();
+    enqueueInput({ type: "key", code: event.code, action: "down" });
+  };
+
+  const handleKeyUp = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.isComposing || !event.code) return;
+    event.preventDefault();
+    event.stopPropagation();
+    enqueueInput({ type: "key", code: event.code, action: "up" });
+  };
+
+  const handleBlur = () => {
+    setControlFocused(false);
+    enqueueInput({ type: "release" });
   };
 
   return (
@@ -206,28 +362,49 @@ function RemoteSession({ device, onClose }: { device: DeviceStatus; onClose: () 
           <div>
             <span className={`remote-dot ${connected ? "online" : ""}`} />
             <strong>{device.displayName}</strong>
-            <small>V2.1 · عرض فقط</small>
+            <small>V2.2 · تحكم بالماوس والكيبورد</small>
           </div>
           <div className="remote-actions">
+            <span className={`control-badge ${controlFocused ? "active" : ""}`}>
+              {controlFocused ? "● التحكم نشط" : "انقر داخل الشاشة للتحكم"}
+            </span>
             <button onClick={fullscreen}>⛶ ملء الشاشة</button>
             <button className="danger" onClick={onClose}>قطع الاتصال</button>
           </div>
         </div>
 
-        <div className="remote-screen" ref={screenRef}>
-          {frameUrl ? <img src={frameUrl} alt={`شاشة ${device.displayName}`} /> : (
+        <div
+          className={`remote-screen ${controlFocused ? "control-focused" : ""}`}
+          ref={screenRef}
+          tabIndex={0}
+          onFocus={() => setControlFocused(true)}
+          onBlur={handleBlur}
+          onPointerMove={handlePointerMove}
+          onPointerDown={handlePointerDown}
+          onPointerUp={handlePointerUp}
+          onWheel={handleWheel}
+          onKeyDown={handleKeyDown}
+          onKeyUp={handleKeyUp}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          {frameUrl ? (
+            <>
+              <img ref={imageRef} src={frameUrl} alt={`شاشة ${device.displayName}`} draggable={false} />
+              {!controlFocused && <div className="remote-control-hint">انقر داخل الشاشة لتفعيل الماوس والكيبورد</div>}
+            </>
+          ) : (
             <div className="remote-waiting">
               <div className="remote-spinner" />
               <strong>{message}</strong>
-              <span>يتم التقاط الشاشة فقط أثناء هذه الجلسة المصادق عليها.</span>
+              <span>يتم التقاط الشاشة وإرسال الإدخال فقط أثناء جلسة المالك المصادق عليها.</span>
             </div>
           )}
         </div>
 
         <div className="remote-footer">
-          <span>🔒 HTTPS + Owner Session</span>
-          <span>Screen View: {connected ? "Active" : "Reconnecting"}</span>
-          <span>Mouse / Keyboard: المرحلة التالية</span>
+          <span>🔒 HTTPS + Owner Session + Agent Token</span>
+          <span>Mouse / Keyboard: {connected ? "Enabled" : "Reconnecting"}</span>
+          <span>Ctrl+Alt+Del وشاشة UAC غير مدعومين في V2.2</span>
         </div>
       </section>
     </div>
@@ -258,22 +435,22 @@ function DeviceCard({ device, onConnect, connecting }: { device: DeviceStatus; o
       </div>
 
       <div className="device-details">
-        <div><span>Remote Engine</span><strong>MAGHRABI Screen V2.1</strong></div>
+        <div><span>Remote Engine</span><strong>MAGHRABI Control V2.2</strong></div>
         <div><span>Agent</span><strong>{device.online ? `متصل ${device.agentVersion ? `v${device.agentVersion}` : ""}` : "بانتظار الاتصال"}</strong></div>
         <div><span>آخر ظهور</span><strong>{formatLastSeen(device.lastSeen, device.online)}</strong></div>
       </div>
 
       <div className="device-actions">
         <button className="connect" disabled={!device.online || connecting} onClick={onConnect}>
-          {connecting ? "جارٍ بدء الجلسة..." : "عرض الشاشة"}
+          {connecting ? "جارٍ بدء الجلسة..." : "اتصال وتحكم"}
         </button>
         <button className="secondary">معلومات الجهاز</button>
       </div>
 
       <p className="hint">
         {device.online
-          ? "V2.1 يتيح عرض الشاشة فقط. لن يتم إرسال أوامر ماوس أو كيبورد في هذه المرحلة."
-          : "شغّل MAGHRABI Remote Agent V2 على جهاز المنزل لبدء جلسة الشاشة."}
+          ? "V2.2 يتيح عرض الشاشة والتحكم بالماوس والكيبورد من المتصفح بعد تسجيل دخول المالك."
+          : "شغّل MAGHRABI Remote Agent V2.2 على جهاز المنزل لبدء جلسة التحكم."}
       </p>
     </article>
   );
@@ -315,7 +492,7 @@ function Dashboard() {
     try {
       const response = await fetch("/api/session/start", { method: "POST", cache: "no-store" });
       if (!response.ok) {
-        setConnectError(response.status === 409 ? "الجهاز غير متصل حاليًا." : "تعذر بدء جلسة الشاشة.");
+        setConnectError(response.status === 409 ? "الجهاز غير متصل حاليًا." : "تعذر بدء جلسة التحكم.");
         return;
       }
       setRemoteOpen(true);
@@ -336,16 +513,16 @@ function Dashboard() {
         </div>
         <div className="hero-badge">
           <span>حالة النظام</span>
-          <strong>V2.1</strong>
-          <small>{apiReady ? "Screen View جاهز" : "جارٍ الاتصال بالخادم"}</small>
+          <strong>V2.2</strong>
+          <small>{apiReady ? "Mouse + Keyboard جاهز" : "جارٍ الاتصال بالخادم"}</small>
         </div>
       </section>
 
       <section className="stats">
         <div className="stat"><span>الأجهزة</span><strong>1</strong><small>جهاز شخصي</small></div>
         <div className="stat"><span>المتصل الآن</span><strong>{device.online ? "1" : "0"}</strong><small>{device.online ? "HOME-PC Online" : "بانتظار Agent"}</small></div>
-        <div className="stat"><span>الجلسات اليوم</span><strong>{device.sessionsToday ?? 0}</strong><small>جلسات عرض الشاشة</small></div>
-        <div className="stat"><span>الوضع</span><strong>View</strong><small>بدون تحكم حتى V2.2</small></div>
+        <div className="stat"><span>الجلسات اليوم</span><strong>{device.sessionsToday ?? 0}</strong><small>جلسات Remote</small></div>
+        <div className="stat"><span>الوضع</span><strong>Control</strong><small>Screen + Mouse + Keyboard</small></div>
       </section>
 
       <div className="section-title">
@@ -401,7 +578,7 @@ function MainPlatform({ onLogout }: { onLogout: () => void }) {
         <div className="security-card">
           <span>SECURITY</span>
           <strong>جلسة مالك محمية</strong>
-          <p>صور الشاشة لا تُعرض إلا بعد تسجيل الدخول، والـAgent يلتقطها فقط عند وجود جلسة عرض نشطة.</p>
+          <p>التحكم لا يعمل إلا أثناء جلسة مالك نشطة، والـAgent يقبل إدخالًا محدودًا للماوس والكيبورد فقط.</p>
         </div>
       </aside>
 

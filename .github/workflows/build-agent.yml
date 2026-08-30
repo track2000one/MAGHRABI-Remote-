@@ -45,7 +45,7 @@ jobs:
           @"
           @echo off
           chcp 65001 >nul
-          title MAGHRABI Remote Agent V2.1.1
+          title MAGHRABI Remote Agent V2.2
           cd /d "%~dp0"
           MAGHRABI-Remote-Agent.exe
           echo.
@@ -55,30 +55,38 @@ jobs:
           "@ | Set-Content -Encoding ASCII agent/publish/RUN-AGENT.bat
 
           @"
-          MAGHRABI Remote Agent V2.1.1
-          =============================
+          MAGHRABI Remote Agent V2.2
+          ===========================
 
           Recommended start method:
-          Double-click RUN-AGENT.bat instead of the EXE during testing.
+          Double-click RUN-AGENT.bat during testing.
 
-          If agent.config.json is missing, the Agent now creates one automatically
-          and stays open so you can edit it.
+          Keep your existing agent.config.json from the working V2.1.1 build.
+          Missing V2.2 options default to enabled automatically.
 
           Required configuration:
           - serverUrl: https://maghrabi-remote-production.up.railway.app
           - token: same MAGHRABI_AGENT_TOKEN value configured in Railway
           - displayName: HOME-PC
           - screenCaptureEnabled: true
+          - remoteControlEnabled: true
+
+          V2.2 capabilities:
+          - Device heartbeat / Online status
+          - Authenticated primary-screen viewing
+          - Mouse movement, left/right/middle click, and wheel
+          - Standard keyboard input including modifiers, arrows, function keys and Windows key
+          - Input is accepted only while the owner has an active authenticated remote session
+          - Held keys/buttons are released automatically when the session ends
+
+          Current limitations:
+          - Ctrl+Alt+Del secure attention sequence is not supported
+          - Windows UAC secure desktop is not controlled
+          - Primary monitor only
+          - Image transport is still JPEG polling; WebRTC comes in a later version
 
           Diagnostics:
-          - The window no longer closes immediately on configuration/runtime errors.
           - Detailed errors are written to agent.log beside the EXE.
-
-          V2.1.1 capabilities:
-          - Device heartbeat / Online status
-          - Authenticated view-only primary-screen capture
-          - Screen capture only during an authenticated owner view session
-          - No mouse or keyboard control yet
           "@ | Set-Content -Encoding UTF8 agent/publish/README-AGENT.txt
 
       - name: Upload Agent artifact

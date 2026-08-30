@@ -13,9 +13,19 @@ namespace MaghrabiRemoteAgent;
 
 internal static class Program
 {
-    private const string AgentVersion = "2.1.1";
+    private const string AgentVersion = "2.2.0";
     private static readonly string BaseDir = AppContext.BaseDirectory;
     private static readonly string LogPath = Path.Combine(BaseDir, "agent.log");
+
+    private const uint MouseLeftDown = 0x0002;
+    private const uint MouseLeftUp = 0x0004;
+    private const uint MouseRightDown = 0x0008;
+    private const uint MouseRightUp = 0x0010;
+    private const uint MouseMiddleDown = 0x0020;
+    private const uint MouseMiddleUp = 0x0040;
+    private const uint MouseWheel = 0x0800;
+    private const uint KeyUp = 0x0002;
+    private const uint KeyExtended = 0x0001;
 
     [STAThread]
     private static async Task<int> Main()
@@ -66,7 +76,8 @@ internal static class Program
                 Token = "PUT_YOUR_RAILWAY_AGENT_TOKEN_HERE",
                 DisplayName = "HOME-PC",
                 IntervalSeconds = 15,
-                ScreenCaptureEnabled = true
+                ScreenCaptureEnabled = true,
+                RemoteControlEnabled = true
             };
             await File.WriteAllTextAsync(configPath, JsonSerializer.Serialize(template, new JsonSerializerOptions { WriteIndented = true }));
             Console.WriteLine("لم يتم العثور على agent.config.json.");
@@ -115,6 +126,7 @@ internal static class Program
         var heartbeatEndpoint = $"{baseUrl}/api/agent/heartbeat";
         var sessionStateEndpoint = $"{baseUrl}/api/agent/session-state";
         var frameEndpoint = $"{baseUrl}/api/agent/frame";
+        var commandsEndpoint = $"{baseUrl}/api/agent/commands";
         var deviceId = CreateDeviceId(Environment.MachineName);
 
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
@@ -129,6 +141,7 @@ internal static class Program
         Console.WriteLine($"الخادم        : {config.ServerUrl}");
         Console.WriteLine($"Agent Version : {AgentVersion}");
         Console.WriteLine($"Screen View   : {(config.ScreenCaptureEnabled ? "Enabled" : "Disabled")}");
+        Console.WriteLine($"Remote Input  : {(config.RemoteControlEnabled ? "Enabled" : "Disabled")}");
         Console.WriteLine($"Log           : {LogPath}");
         Console.WriteLine("الحالة        : بدء الاتصال...");
         Console.WriteLine("اضغط Ctrl+C لإيقاف Agent.");
@@ -138,8 +151,11 @@ internal static class Program
         var screenTask = config.ScreenCaptureEnabled
             ? RunScreenLoopAsync(http, sessionStateEndpoint, frameEndpoint, stop.Token)
             : Task.CompletedTask;
+        var controlTask = config.RemoteControlEnabled
+            ? RunControlLoopAsync(http, commandsEndpoint, stop.Token)
+            : Task.CompletedTask;
 
-        await Task.WhenAll(heartbeatTask, screenTask);
+        await Task.WhenAll(heartbeatTask, screenTask, controlTask);
         WriteLog("STOP", "Agent stopped normally.");
         return 0;
     }
@@ -147,7 +163,7 @@ internal static class Program
     private static void Header()
     {
         Console.WriteLine("====================================================");
-        Console.WriteLine("          MAGHRABI REMOTE AGENT V2.1.1");
+        Console.WriteLine("           MAGHRABI REMOTE AGENT V2.2");
         Console.WriteLine("====================================================");
     }
 
@@ -230,7 +246,7 @@ internal static class Program
                         if (!wasStreaming)
                         {
                             Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] SCREEN ▶  بدأ عرض الشاشة");
-                            WriteLog("SCREEN", "Authenticated view session started.");
+                            WriteLog("SCREEN", "Authenticated screen session started.");
                             wasStreaming = true;
                         }
 
@@ -246,7 +262,7 @@ internal static class Program
                         if (wasStreaming)
                         {
                             Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] SCREEN ■  انتهت جلسة العرض");
-                            WriteLog("SCREEN", "View session ended.");
+                            WriteLog("SCREEN", "Screen session ended.");
                             wasStreaming = false;
                         }
                         delayMs = 1200;
@@ -267,6 +283,264 @@ internal static class Program
             catch (OperationCanceledException) { break; }
         }
     }
+
+    private static async Task RunControlLoopAsync(HttpClient http, string commandsEndpoint, CancellationToken token)
+    {
+        long lastSeq = 0;
+        var wasActive = false;
+        var heldKeys = new Dictionary<byte, uint>();
+        var heldButtons = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                var delayMs = wasActive ? 80 : 1000;
+                try
+                {
+                    using var response = await http.GetAsync($"{commandsEndpoint}?after={lastSeq}", token);
+                    if ((int)response.StatusCode == 401)
+                    {
+                        if (wasActive) ReleaseAllInputs(heldKeys, heldButtons);
+                        wasActive = false;
+                        delayMs = 3000;
+                    }
+                    else if (response.IsSuccessStatusCode)
+                    {
+                        var batch = await response.Content.ReadFromJsonAsync<CommandBatch>(cancellationToken: token);
+                        if (batch is null)
+                        {
+                            delayMs = 1000;
+                        }
+                        else
+                        {
+                            if (batch.LatestSeq < lastSeq) lastSeq = 0;
+                            var active = batch.Active && batch.ControlRequested;
+                            if (active)
+                            {
+                                if (!wasActive)
+                                {
+                                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] CONTROL ▶  بدأ التحكم بالماوس والكيبورد");
+                                    WriteLog("CONTROL", "Authenticated remote input session started.");
+                                }
+                                wasActive = true;
+                                delayMs = 80;
+
+                                foreach (var command in batch.Commands.OrderBy(item => item.Seq))
+                                {
+                                    if (command.Seq <= lastSeq) continue;
+                                    try
+                                    {
+                                        ApplyRemoteCommand(command, heldKeys, heldButtons);
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        WriteLog("CONTROL-COMMAND", $"Seq {command.Seq}: {ex}");
+                                    }
+                                    lastSeq = command.Seq;
+                                }
+                            }
+                            else
+                            {
+                                if (wasActive)
+                                {
+                                    ReleaseAllInputs(heldKeys, heldButtons);
+                                    Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] CONTROL ■  انتهت جلسة التحكم");
+                                    WriteLog("CONTROL", "Remote input session ended.");
+                                }
+                                wasActive = false;
+                                lastSeq = Math.Max(lastSeq, batch.LatestSeq);
+                                delayMs = 1000;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        delayMs = 1500;
+                    }
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
+                catch (Exception ex)
+                {
+                    if (wasActive)
+                    {
+                        ReleaseAllInputs(heldKeys, heldButtons);
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] CONTROL OFFLINE ✗  {ex.Message}");
+                    }
+                    WriteLog("CONTROL-ERROR", ex.ToString());
+                    wasActive = false;
+                    delayMs = 1500;
+                }
+
+                try { await Task.Delay(delayMs, token); }
+                catch (OperationCanceledException) { break; }
+            }
+        }
+        finally
+        {
+            ReleaseAllInputs(heldKeys, heldButtons);
+        }
+    }
+
+    private static void ApplyRemoteCommand(RemoteCommand command, Dictionary<byte, uint> heldKeys, HashSet<string> heldButtons)
+    {
+        switch (command.Type)
+        {
+            case "move":
+                if (command.X is not null && command.Y is not null)
+                    MoveCursorNormalized(command.X.Value, command.Y.Value);
+                break;
+
+            case "button":
+                ApplyMouseButton(command.Button, command.Action, heldButtons);
+                break;
+
+            case "wheel":
+                if (command.Delta is not null)
+                {
+                    var delta = Math.Clamp(command.Delta.Value, -1200, 1200);
+                    mouse_event(MouseWheel, 0, 0, unchecked((uint)delta), UIntPtr.Zero);
+                }
+                break;
+
+            case "key":
+                ApplyKeyboard(command.Code, command.Action, heldKeys);
+                break;
+
+            case "release":
+                ReleaseAllInputs(heldKeys, heldButtons);
+                break;
+        }
+    }
+
+    private static void MoveCursorNormalized(double x, double y)
+    {
+        var screen = Screen.PrimaryScreen ?? throw new InvalidOperationException("Primary screen not found");
+        var bounds = screen.Bounds;
+        x = Math.Clamp(x, 0d, 1d);
+        y = Math.Clamp(y, 0d, 1d);
+        var px = bounds.Left + (int)Math.Round(x * Math.Max(0, bounds.Width - 1));
+        var py = bounds.Top + (int)Math.Round(y * Math.Max(0, bounds.Height - 1));
+        SetCursorPos(px, py);
+    }
+
+    private static void ApplyMouseButton(string? button, string? action, HashSet<string> heldButtons)
+    {
+        if (string.IsNullOrWhiteSpace(button) || string.IsNullOrWhiteSpace(action)) return;
+        var down = action.Equals("down", StringComparison.OrdinalIgnoreCase);
+        uint flag = (button.ToLowerInvariant(), down) switch
+        {
+            ("left", true) => MouseLeftDown,
+            ("left", false) => MouseLeftUp,
+            ("right", true) => MouseRightDown,
+            ("right", false) => MouseRightUp,
+            ("middle", true) => MouseMiddleDown,
+            ("middle", false) => MouseMiddleUp,
+            _ => 0
+        };
+        if (flag == 0) return;
+        mouse_event(flag, 0, 0, 0, UIntPtr.Zero);
+        if (down) heldButtons.Add(button); else heldButtons.Remove(button);
+    }
+
+    private static void ApplyKeyboard(string? code, string? action, Dictionary<byte, uint> heldKeys)
+    {
+        if (string.IsNullOrWhiteSpace(code) || string.IsNullOrWhiteSpace(action)) return;
+        var virtualKey = VirtualKeyFromCode(code);
+        if (virtualKey is null) return;
+
+        var extended = IsExtendedKey(code) ? KeyExtended : 0u;
+        if (action.Equals("down", StringComparison.OrdinalIgnoreCase))
+        {
+            keybd_event(virtualKey.Value, 0, extended, UIntPtr.Zero);
+            heldKeys[virtualKey.Value] = extended;
+        }
+        else if (action.Equals("up", StringComparison.OrdinalIgnoreCase))
+        {
+            keybd_event(virtualKey.Value, 0, extended | KeyUp, UIntPtr.Zero);
+            heldKeys.Remove(virtualKey.Value);
+        }
+    }
+
+    private static void ReleaseAllInputs(Dictionary<byte, uint> heldKeys, HashSet<string> heldButtons)
+    {
+        foreach (var item in heldKeys.ToArray())
+        {
+            keybd_event(item.Key, 0, item.Value | KeyUp, UIntPtr.Zero);
+        }
+        heldKeys.Clear();
+
+        if (heldButtons.Contains("left")) mouse_event(MouseLeftUp, 0, 0, 0, UIntPtr.Zero);
+        if (heldButtons.Contains("right")) mouse_event(MouseRightUp, 0, 0, 0, UIntPtr.Zero);
+        if (heldButtons.Contains("middle")) mouse_event(MouseMiddleUp, 0, 0, 0, UIntPtr.Zero);
+        heldButtons.Clear();
+    }
+
+    private static byte? VirtualKeyFromCode(string code)
+    {
+        if (code.Length == 4 && code.StartsWith("Key", StringComparison.Ordinal) && char.IsLetter(code[3]))
+            return (byte)char.ToUpperInvariant(code[3]);
+        if (code.Length == 6 && code.StartsWith("Digit", StringComparison.Ordinal) && char.IsDigit(code[5]))
+            return (byte)code[5];
+        if (code.Length == 7 && code.StartsWith("Numpad", StringComparison.Ordinal) && char.IsDigit(code[6]))
+            return (byte)(0x60 + (code[6] - '0'));
+        if (code.StartsWith("F", StringComparison.Ordinal) && int.TryParse(code[1..], out var function) && function is >= 1 and <= 24)
+            return (byte)(0x70 + function - 1);
+
+        return code switch
+        {
+            "Backspace" => 0x08,
+            "Tab" => 0x09,
+            "Enter" => 0x0D,
+            "ShiftLeft" or "ShiftRight" => 0x10,
+            "ControlLeft" or "ControlRight" => 0x11,
+            "AltLeft" or "AltRight" => 0x12,
+            "Pause" => 0x13,
+            "CapsLock" => 0x14,
+            "Escape" => 0x1B,
+            "Space" => 0x20,
+            "PageUp" => 0x21,
+            "PageDown" => 0x22,
+            "End" => 0x23,
+            "Home" => 0x24,
+            "ArrowLeft" => 0x25,
+            "ArrowUp" => 0x26,
+            "ArrowRight" => 0x27,
+            "ArrowDown" => 0x28,
+            "PrintScreen" => 0x2C,
+            "Insert" => 0x2D,
+            "Delete" => 0x2E,
+            "MetaLeft" => 0x5B,
+            "MetaRight" => 0x5C,
+            "ContextMenu" => 0x5D,
+            "NumpadMultiply" => 0x6A,
+            "NumpadAdd" => 0x6B,
+            "NumpadSubtract" => 0x6D,
+            "NumpadDecimal" => 0x6E,
+            "NumpadDivide" => 0x6F,
+            "NumLock" => 0x90,
+            "ScrollLock" => 0x91,
+            "Semicolon" => 0xBA,
+            "Equal" => 0xBB,
+            "Comma" => 0xBC,
+            "Minus" => 0xBD,
+            "Period" => 0xBE,
+            "Slash" => 0xBF,
+            "Backquote" => 0xC0,
+            "BracketLeft" => 0xDB,
+            "Backslash" => 0xDC,
+            "BracketRight" => 0xDD,
+            "Quote" => 0xDE,
+            "IntlBackslash" => 0xE2,
+            _ => null
+        };
+    }
+
+    private static bool IsExtendedKey(string code) => code is
+        "ControlRight" or "AltRight" or "MetaLeft" or "MetaRight" or "ContextMenu" or
+        "Insert" or "Delete" or "Home" or "End" or "PageUp" or "PageDown" or
+        "ArrowLeft" or "ArrowUp" or "ArrowRight" or "ArrowDown" or
+        "NumpadDivide" or "PrintScreen";
 
     private static byte[] CapturePrimaryScreenJpeg(long quality, int maxWidth)
     {
@@ -315,6 +589,15 @@ internal static class Program
         return value.Length <= max ? value : value[..max] + "…";
     }
 
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetCursorPos(int x, int y);
+
+    [DllImport("user32.dll")]
+    private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+
+    [DllImport("user32.dll")]
+    private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
     internal sealed class AgentConfig
     {
         public string ServerUrl { get; set; } = "https://maghrabi-remote-production.up.railway.app";
@@ -322,6 +605,7 @@ internal static class Program
         public string DisplayName { get; set; } = "HOME-PC";
         public int IntervalSeconds { get; set; } = 15;
         public bool ScreenCaptureEnabled { get; set; } = true;
+        public bool RemoteControlEnabled { get; set; } = true;
     }
 
     internal sealed record HeartbeatPayload(string DeviceId, string DisplayName, string Hostname, string Os,
@@ -330,6 +614,27 @@ internal static class Program
     internal sealed class SessionState
     {
         public bool ScreenRequested { get; set; }
+        public bool ControlRequested { get; set; }
         public int CaptureIntervalMs { get; set; } = 1200;
+    }
+
+    internal sealed class CommandBatch
+    {
+        public bool Active { get; set; }
+        public bool ControlRequested { get; set; }
+        public long LatestSeq { get; set; }
+        public List<RemoteCommand> Commands { get; set; } = new();
+    }
+
+    internal sealed class RemoteCommand
+    {
+        public long Seq { get; set; }
+        public string Type { get; set; } = string.Empty;
+        public double? X { get; set; }
+        public double? Y { get; set; }
+        public string? Button { get; set; }
+        public string? Action { get; set; }
+        public int? Delta { get; set; }
+        public string? Code { get; set; }
     }
 }

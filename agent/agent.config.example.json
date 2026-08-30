@@ -2,5 +2,7 @@
   "serverUrl": "https://maghrabi-remote-production.up.railway.app",
   "token": "PUT_YOUR_RAILWAY_AGENT_TOKEN_HERE",
   "displayName": "HOME-PC",
-  "intervalSeconds": 15
+  "intervalSeconds": 15,
+  "screenCaptureEnabled": true,
+  "remoteControlEnabled": true
 }
