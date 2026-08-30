@@ -5,6 +5,11 @@ on:
     branches: [main]
     paths:
       - "agent/**"
+      - "src/**"
+      - "package.json"
+      - "tsconfig.json"
+      - "vite.config.ts"
+      - "server.mjs"
       - ".github/workflows/build-agent.yml"
   workflow_dispatch:
 
@@ -17,6 +22,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install web dependencies
+        run: npm install
+
+      - name: Validate React production build
+        run: npm run build
 
       - name: Setup .NET 8
         uses: actions/setup-dotnet@v4
