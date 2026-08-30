@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
+import "./remote.css";
 
 type Page = "dashboard" | "devices" | "sessions" | "security" | "settings";
 
@@ -8,6 +9,12 @@ type DeviceStatus = {
   os: string;
   lastSeen: string | null;
   agentVersion: string | null;
+  sessionsToday?: number;
+};
+
+type AuthStatus = {
+  configured: boolean;
+  authenticated: boolean;
 };
 
 const labels: Record<Page, string> = {
@@ -32,13 +39,14 @@ const initialDevice: DeviceStatus = {
   os: "Windows PC",
   lastSeen: null,
   agentVersion: null,
+  sessionsToday: 0,
 };
 
 function formatLastSeen(value: string | null, online: boolean) {
   if (online) return "الآن";
   if (!value) return "—";
   try {
-    return new Date(value).toLocaleString("ar-EG", {
+    return new Date(value).toLocaleString("ar-SA", {
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
@@ -50,7 +58,183 @@ function formatLastSeen(value: string | null, online: boolean) {
   }
 }
 
-function DeviceCard({ device }: { device: DeviceStatus }) {
+function LoginScreen({ configured, onLogin }: { configured: boolean; onLogin: () => void }) {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  if (!configured) {
+    return (
+      <div className="auth-shell">
+        <section className="auth-card setup-card">
+          <div className="auth-logo">M</div>
+          <span className="auth-kicker">SECURITY SETUP REQUIRED</span>
+          <h1>فعّل حماية المالك أولًا</h1>
+          <p>قبل عرض شاشة جهاز المنزل، أضف متغير البيئة التالي في Railway ثم انتظر إعادة النشر:</p>
+          <code>MAGHRABI_OWNER_PASSWORD</code>
+          <small>استخدم كلمة مرور قوية ومختلفة عن كلمة مرور Windows وRustDesk. لا تحفظها داخل GitHub.</small>
+        </section>
+      </div>
+    );
+  }
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setError("");
+    setLoading(true);
+    try {
+      const response = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password }),
+      });
+      if (!response.ok) {
+        setError(response.status === 429 ? "محاولات كثيرة. حاول لاحقًا." : "كلمة المرور غير صحيحة.");
+        return;
+      }
+      setPassword("");
+      onLogin();
+    } catch {
+      setError("تعذر الاتصال بالخادم.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="auth-shell">
+      <form className="auth-card" onSubmit={submit}>
+        <div className="auth-logo">M</div>
+        <span className="auth-kicker">MAGHRABI REMOTE</span>
+        <h1>دخول مالك النظام</h1>
+        <p>تسجيل الدخول مطلوب قبل الوصول إلى حالة الجهاز أو شاشة HOME-PC.</p>
+        <label>
+          <span>كلمة المرور</span>
+          <input
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            autoComplete="current-password"
+            autoFocus
+            required
+          />
+        </label>
+        {error && <div className="auth-error">{error}</div>}
+        <button className="auth-submit" type="submit" disabled={loading}>
+          {loading ? "جارٍ التحقق..." : "دخول آمن"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function RemoteSession({ device, onClose }: { device: DeviceStatus; onClose: () => void }) {
+  const [frameUrl, setFrameUrl] = useState<string | null>(null);
+  const [message, setMessage] = useState("بانتظار أول صورة من Agent...");
+  const [connected, setConnected] = useState(true);
+  const screenRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let active = true;
+    let currentUrl: string | null = null;
+
+    const keepAlive = async () => {
+      try {
+        const response = await fetch("/api/session/keepalive", { method: "POST", cache: "no-store" });
+        if (active) setConnected(response.ok);
+      } catch {
+        if (active) setConnected(false);
+      }
+    };
+
+    const loadFrame = async () => {
+      try {
+        const response = await fetch(`/api/session/frame?t=${Date.now()}`, { cache: "no-store" });
+        if (response.status === 204) {
+          if (active) setMessage("Agent متصل — جارٍ تجهيز لقطة الشاشة...");
+          return;
+        }
+        if (response.status === 401) {
+          if (active) {
+            setConnected(false);
+            setMessage("انتهت جلسة تسجيل الدخول.");
+          }
+          return;
+        }
+        if (!response.ok) throw new Error("frame unavailable");
+        const blob = await response.blob();
+        const nextUrl = URL.createObjectURL(blob);
+        if (!active) {
+          URL.revokeObjectURL(nextUrl);
+          return;
+        }
+        if (currentUrl) URL.revokeObjectURL(currentUrl);
+        currentUrl = nextUrl;
+        setFrameUrl(nextUrl);
+        setMessage("");
+      } catch {
+        if (active) setMessage("تعذر استلام صورة الشاشة مؤقتًا...");
+      }
+    };
+
+    keepAlive();
+    loadFrame();
+    const keepAliveTimer = window.setInterval(keepAlive, 10_000);
+    const frameTimer = window.setInterval(loadFrame, 1_200);
+
+    return () => {
+      active = false;
+      window.clearInterval(keepAliveTimer);
+      window.clearInterval(frameTimer);
+      if (currentUrl) URL.revokeObjectURL(currentUrl);
+      fetch("/api/session/stop", { method: "POST", keepalive: true }).catch(() => undefined);
+    };
+  }, []);
+
+  const fullscreen = async () => {
+    try {
+      await screenRef.current?.requestFullscreen();
+    } catch {
+      // Browser may deny fullscreen when not initiated by the user.
+    }
+  };
+
+  return (
+    <div className="remote-overlay">
+      <section className="remote-window">
+        <div className="remote-toolbar">
+          <div>
+            <span className={`remote-dot ${connected ? "online" : ""}`} />
+            <strong>{device.displayName}</strong>
+            <small>V2.1 · عرض فقط</small>
+          </div>
+          <div className="remote-actions">
+            <button onClick={fullscreen}>⛶ ملء الشاشة</button>
+            <button className="danger" onClick={onClose}>قطع الاتصال</button>
+          </div>
+        </div>
+
+        <div className="remote-screen" ref={screenRef}>
+          {frameUrl ? <img src={frameUrl} alt={`شاشة ${device.displayName}`} /> : (
+            <div className="remote-waiting">
+              <div className="remote-spinner" />
+              <strong>{message}</strong>
+              <span>يتم التقاط الشاشة فقط أثناء هذه الجلسة المصادق عليها.</span>
+            </div>
+          )}
+        </div>
+
+        <div className="remote-footer">
+          <span>🔒 HTTPS + Owner Session</span>
+          <span>Screen View: {connected ? "Active" : "Reconnecting"}</span>
+          <span>Mouse / Keyboard: المرحلة التالية</span>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function DeviceCard({ device, onConnect, connecting }: { device: DeviceStatus; onConnect: () => void; connecting: boolean }) {
   return (
     <article className="device-card">
       <div className="device-top">
@@ -74,20 +258,22 @@ function DeviceCard({ device }: { device: DeviceStatus }) {
       </div>
 
       <div className="device-details">
-        <div><span>Remote Engine</span><strong>RustDesk / المرحلة التالية</strong></div>
+        <div><span>Remote Engine</span><strong>MAGHRABI Screen V2.1</strong></div>
         <div><span>Agent</span><strong>{device.online ? `متصل ${device.agentVersion ? `v${device.agentVersion}` : ""}` : "بانتظار الاتصال"}</strong></div>
         <div><span>آخر ظهور</span><strong>{formatLastSeen(device.lastSeen, device.online)}</strong></div>
       </div>
 
       <div className="device-actions">
-        <button className="connect" disabled>اتصال عن بعد</button>
+        <button className="connect" disabled={!device.online || connecting} onClick={onConnect}>
+          {connecting ? "جارٍ بدء الجلسة..." : "عرض الشاشة"}
+        </button>
         <button className="secondary">معلومات الجهاز</button>
       </div>
 
       <p className="hint">
         {device.online
-          ? "Agent متصل بمنصة Railway بنجاح. سيتم تفعيل التحكم بالشاشة والماوس والكيبورد في المرحلة التالية."
-          : "شغّل MAGHRABI Remote Agent على جهاز المنزل ليتحول الجهاز إلى Online."}
+          ? "V2.1 يتيح عرض الشاشة فقط. لن يتم إرسال أوامر ماوس أو كيبورد في هذه المرحلة."
+          : "شغّل MAGHRABI Remote Agent V2 على جهاز المنزل لبدء جلسة الشاشة."}
       </p>
     </article>
   );
@@ -96,10 +282,12 @@ function DeviceCard({ device }: { device: DeviceStatus }) {
 function Dashboard() {
   const [device, setDevice] = useState<DeviceStatus>(initialDevice);
   const [apiReady, setApiReady] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [remoteOpen, setRemoteOpen] = useState(false);
+  const [connectError, setConnectError] = useState("");
 
   useEffect(() => {
     let active = true;
-
     const load = async () => {
       try {
         const response = await fetch("/api/device-status", { cache: "no-store" });
@@ -113,7 +301,6 @@ function Dashboard() {
         if (active) setApiReady(false);
       }
     };
-
     load();
     const timer = window.setInterval(load, 5000);
     return () => {
@@ -121,6 +308,23 @@ function Dashboard() {
       window.clearInterval(timer);
     };
   }, []);
+
+  const connect = async () => {
+    setConnecting(true);
+    setConnectError("");
+    try {
+      const response = await fetch("/api/session/start", { method: "POST", cache: "no-store" });
+      if (!response.ok) {
+        setConnectError(response.status === 409 ? "الجهاز غير متصل حاليًا." : "تعذر بدء جلسة الشاشة.");
+        return;
+      }
+      setRemoteOpen(true);
+    } catch {
+      setConnectError("تعذر الاتصال بالخادم.");
+    } finally {
+      setConnecting(false);
+    }
+  };
 
   return (
     <>
@@ -132,22 +336,24 @@ function Dashboard() {
         </div>
         <div className="hero-badge">
           <span>حالة النظام</span>
-          <strong>V0.2</strong>
-          <small>{apiReady ? "Railway API جاهز للـ Agent" : "جارٍ الاتصال بالخادم"}</small>
+          <strong>V2.1</strong>
+          <small>{apiReady ? "Screen View جاهز" : "جارٍ الاتصال بالخادم"}</small>
         </div>
       </section>
 
       <section className="stats">
         <div className="stat"><span>الأجهزة</span><strong>1</strong><small>جهاز شخصي</small></div>
         <div className="stat"><span>المتصل الآن</span><strong>{device.online ? "1" : "0"}</strong><small>{device.online ? "HOME-PC Online" : "بانتظار Agent"}</small></div>
-        <div className="stat"><span>الجلسات اليوم</span><strong>0</strong><small>Remote Desktop قريبًا</small></div>
-        <div className="stat"><span>الخادم</span><strong>{apiReady ? "جاهز" : "..."}</strong><small>Railway Production</small></div>
+        <div className="stat"><span>الجلسات اليوم</span><strong>{device.sessionsToday ?? 0}</strong><small>جلسات عرض الشاشة</small></div>
+        <div className="stat"><span>الوضع</span><strong>View</strong><small>بدون تحكم حتى V2.2</small></div>
       </section>
 
       <div className="section-title">
         <div><span>MY DEVICES</span><h2>أجهزتي</h2></div>
       </div>
-      <DeviceCard device={device} />
+      {connectError && <div className="connect-error">{connectError}</div>}
+      <DeviceCard device={device} onConnect={connect} connecting={connecting} />
+      {remoteOpen && <RemoteSession device={device} onClose={() => setRemoteOpen(false)} />}
     </>
   );
 }
@@ -162,9 +368,14 @@ function Placeholder({ page }: { page: Page }) {
   );
 }
 
-export default function App() {
+function MainPlatform({ onLogout }: { onLogout: () => void }) {
   const [page, setPage] = useState<Page>("dashboard");
   const [menuOpen, setMenuOpen] = useState(false);
+
+  const logout = async () => {
+    await fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
+    onLogout();
+  };
 
   return (
     <div className="app">
@@ -189,8 +400,8 @@ export default function App() {
 
         <div className="security-card">
           <span>SECURITY</span>
-          <strong>منصة شخصية</strong>
-          <p>Agent يستخدم Bearer Token لا يتم حفظه داخل GitHub أو واجهة React.</p>
+          <strong>جلسة مالك محمية</strong>
+          <p>صور الشاشة لا تُعرض إلا بعد تسجيل الدخول، والـAgent يلتقطها فقط عند وجود جلسة عرض نشطة.</p>
         </div>
       </aside>
 
@@ -200,7 +411,10 @@ export default function App() {
             <button className="menu" onClick={() => setMenuOpen(true)}>☰</button>
             <div><span>MAGHRABI REMOTE</span><h1>{labels[page]}</h1></div>
           </div>
-          <div className="owner"><span className="owner-dot" /><div><strong>مالك النظام</strong><small>Private Account</small></div></div>
+          <button className="owner owner-button" onClick={logout} title="تسجيل الخروج">
+            <span className="owner-dot" />
+            <div><strong>مالك النظام</strong><small>تسجيل الخروج</small></div>
+          </button>
         </header>
 
         <div className="content">
@@ -209,4 +423,32 @@ export default function App() {
       </main>
     </div>
   );
+}
+
+export default function App() {
+  const [auth, setAuth] = useState<AuthStatus | null>(null);
+
+  const refreshAuth = async () => {
+    try {
+      const response = await fetch("/api/auth/status", { cache: "no-store" });
+      const data = (await response.json()) as AuthStatus;
+      setAuth(data);
+    } catch {
+      setAuth({ configured: false, authenticated: false });
+    }
+  };
+
+  useEffect(() => {
+    refreshAuth();
+  }, []);
+
+  if (!auth) {
+    return <div className="auth-shell"><div className="remote-spinner" /></div>;
+  }
+
+  if (!auth.authenticated) {
+    return <LoginScreen configured={auth.configured} onLogin={() => setAuth({ ...auth, authenticated: true })} />;
+  }
+
+  return <MainPlatform onLogout={() => setAuth({ ...auth, authenticated: false })} />;
 }

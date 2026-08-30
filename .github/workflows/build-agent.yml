@@ -43,16 +43,21 @@ jobs:
         run: |
           Copy-Item agent/agent.config.example.json agent/publish/agent.config.example.json
           @"
-          MAGHRABI Remote Agent V1
-          =========================
+          MAGHRABI Remote Agent V2.1
+          ===========================
 
           1. Rename agent.config.example.json to agent.config.json
           2. Put the Railway MAGHRABI_AGENT_TOKEN value in the token field.
           3. Keep agent.config.json beside MAGHRABI-Remote-Agent.exe
-          4. Run MAGHRABI-Remote-Agent.exe
+          4. Run MAGHRABI-Remote-Agent.exe on HOME-PC.
 
-          V1 sends only device heartbeat/status metadata.
-          It does not capture the screen or control mouse/keyboard yet.
+          V2.1 capabilities:
+          - Device heartbeat / Online status
+          - Authenticated view-only primary-screen capture
+          - Screen capture starts only while the owner has an active web session
+          - No mouse or keyboard control in this version
+
+          Railway also requires MAGHRABI_OWNER_PASSWORD before screen viewing is enabled.
           "@ | Set-Content -Encoding UTF8 agent/publish/README-AGENT.txt
 
       - name: Upload Agent artifact
