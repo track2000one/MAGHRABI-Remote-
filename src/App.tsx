@@ -337,14 +337,14 @@ function RemoteSession({ device, onClose }: { device: DeviceStatus; onClose: () 
   };
 
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (event.isComposing || !event.code) return;
+    if (event.nativeEvent.isComposing || !event.code) return;
     event.preventDefault();
     event.stopPropagation();
     enqueueInput({ type: "key", code: event.code, action: "down" });
   };
 
   const handleKeyUp = (event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (event.isComposing || !event.code) return;
+    if (event.nativeEvent.isComposing || !event.code) return;
     event.preventDefault();
     event.stopPropagation();
     enqueueInput({ type: "key", code: event.code, action: "up" });
