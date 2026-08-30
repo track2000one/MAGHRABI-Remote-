@@ -1,6 +1,14 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 type Page = "dashboard" | "devices" | "sessions" | "security" | "settings";
+
+type DeviceStatus = {
+  online: boolean;
+  displayName: string;
+  os: string;
+  lastSeen: string | null;
+  agentVersion: string | null;
+};
 
 const labels: Record<Page, string> = {
   dashboard: "لوحة التحكم",
@@ -18,37 +26,102 @@ const nav: { id: Page; icon: string; label: string }[] = [
   { id: "settings", icon: "⚙", label: "الإعدادات" },
 ];
 
-function DeviceCard() {
+const initialDevice: DeviceStatus = {
+  online: false,
+  displayName: "HOME-PC",
+  os: "Windows PC",
+  lastSeen: null,
+  agentVersion: null,
+};
+
+function formatLastSeen(value: string | null, online: boolean) {
+  if (online) return "الآن";
+  if (!value) return "—";
+  try {
+    return new Date(value).toLocaleString("ar-EG", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return "—";
+  }
+}
+
+function DeviceCard({ device }: { device: DeviceStatus }) {
   return (
     <article className="device-card">
       <div className="device-top">
         <div className="computer-icon">▰</div>
         <div>
           <div className="device-title-row">
-            <h3>HOME-PC</h3>
-            <span className="status pending">غير مربوط</span>
+            <h3>{device.displayName || "HOME-PC"}</h3>
+            <span
+              className={`status ${device.online ? "" : "pending"}`}
+              style={device.online ? {
+                background: "rgba(66,215,162,.1)",
+                color: "#55e2b1",
+                border: "1px solid rgba(66,215,162,.16)",
+              } : undefined}
+            >
+              {device.online ? "متصل الآن" : "غير متصل"}
+            </span>
           </div>
-          <p>Windows PC · الجهاز المنزلي</p>
+          <p>{device.os || "Windows PC"} · الجهاز المنزلي</p>
         </div>
       </div>
 
       <div className="device-details">
-        <div><span>Remote Engine</span><strong>RustDesk</strong></div>
-        <div><span>Agent</span><strong>بانتظار الربط</strong></div>
-        <div><span>آخر ظهور</span><strong>—</strong></div>
+        <div><span>Remote Engine</span><strong>RustDesk / المرحلة التالية</strong></div>
+        <div><span>Agent</span><strong>{device.online ? `متصل ${device.agentVersion ? `v${device.agentVersion}` : ""}` : "بانتظار الاتصال"}</strong></div>
+        <div><span>آخر ظهور</span><strong>{formatLastSeen(device.lastSeen, device.online)}</strong></div>
       </div>
 
       <div className="device-actions">
         <button className="connect" disabled>اتصال عن بعد</button>
-        <button className="secondary">إعداد الجهاز</button>
+        <button className="secondary">معلومات الجهاز</button>
       </div>
 
-      <p className="hint">سيتم تفعيل الاتصال بعد ربط Agent بالخادم. لا يتم حفظ كلمة مرور RustDesk داخل الواجهة.</p>
+      <p className="hint">
+        {device.online
+          ? "Agent متصل بمنصة Railway بنجاح. سيتم تفعيل التحكم بالشاشة والماوس والكيبورد في المرحلة التالية."
+          : "شغّل MAGHRABI Remote Agent على جهاز المنزل ليتحول الجهاز إلى Online."}
+      </p>
     </article>
   );
 }
 
 function Dashboard() {
+  const [device, setDevice] = useState<DeviceStatus>(initialDevice);
+  const [apiReady, setApiReady] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+
+    const load = async () => {
+      try {
+        const response = await fetch("/api/device-status", { cache: "no-store" });
+        if (!response.ok) throw new Error("API unavailable");
+        const data = (await response.json()) as DeviceStatus;
+        if (active) {
+          setDevice(data);
+          setApiReady(true);
+        }
+      } catch {
+        if (active) setApiReady(false);
+      }
+    };
+
+    load();
+    const timer = window.setInterval(load, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
   return (
     <>
       <section className="hero">
@@ -59,22 +132,22 @@ function Dashboard() {
         </div>
         <div className="hero-badge">
           <span>حالة النظام</span>
-          <strong>V0.1</strong>
-          <small>واجهة أولية جاهزة للربط</small>
+          <strong>V0.2</strong>
+          <small>{apiReady ? "Railway API جاهز للـ Agent" : "جارٍ الاتصال بالخادم"}</small>
         </div>
       </section>
 
       <section className="stats">
-        <div className="stat"><span>الأجهزة</span><strong>1</strong><small>جهاز مسجل</small></div>
-        <div className="stat"><span>المتصل الآن</span><strong>0</strong><small>بانتظار Agent</small></div>
-        <div className="stat"><span>الجلسات اليوم</span><strong>0</strong><small>لا توجد جلسات</small></div>
-        <div className="stat"><span>الأمان</span><strong>جاهز</strong><small>لا توجد أسرار في الواجهة</small></div>
+        <div className="stat"><span>الأجهزة</span><strong>1</strong><small>جهاز شخصي</small></div>
+        <div className="stat"><span>المتصل الآن</span><strong>{device.online ? "1" : "0"}</strong><small>{device.online ? "HOME-PC Online" : "بانتظار Agent"}</small></div>
+        <div className="stat"><span>الجلسات اليوم</span><strong>0</strong><small>Remote Desktop قريبًا</small></div>
+        <div className="stat"><span>الخادم</span><strong>{apiReady ? "جاهز" : "..."}</strong><small>Railway Production</small></div>
       </section>
 
       <div className="section-title">
         <div><span>MY DEVICES</span><h2>أجهزتي</h2></div>
       </div>
-      <DeviceCard />
+      <DeviceCard device={device} />
     </>
   );
 }
@@ -117,7 +190,7 @@ export default function App() {
         <div className="security-card">
           <span>SECURITY</span>
           <strong>منصة شخصية</strong>
-          <p>سيتم دعم 2FA والأجهزة الموثوقة وسجل جميع الاتصالات.</p>
+          <p>Agent يستخدم Bearer Token لا يتم حفظه داخل GitHub أو واجهة React.</p>
         </div>
       </aside>
 
