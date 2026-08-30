@@ -1,0 +1,64 @@
+name: Build MAGHRABI Remote Agent
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - ".github/workflows/build-agent.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-agent:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore agent/MaghrabiRemoteAgent.csproj
+
+      - name: Publish Windows x64 single EXE
+        run: >-
+          dotnet publish agent/MaghrabiRemoteAgent.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=None
+          -p:DebugSymbols=false
+          -o agent/publish
+
+      - name: Prepare package
+        shell: pwsh
+        run: |
+          Copy-Item agent/agent.config.example.json agent/publish/agent.config.example.json
+          @"
+          MAGHRABI Remote Agent V1
+          =========================
+
+          1. Rename agent.config.example.json to agent.config.json
+          2. Put the Railway MAGHRABI_AGENT_TOKEN value in the token field.
+          3. Keep agent.config.json beside MAGHRABI-Remote-Agent.exe
+          4. Run MAGHRABI-Remote-Agent.exe
+
+          V1 sends only device heartbeat/status metadata.
+          It does not capture the screen or control mouse/keyboard yet.
+          "@ | Set-Content -Encoding UTF8 agent/publish/README-AGENT.txt
+
+      - name: Upload Agent artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MAGHRABI-Remote-Agent-Windows-x64
+          path: agent/publish/
+          if-no-files-found: error
+          retention-days: 30
