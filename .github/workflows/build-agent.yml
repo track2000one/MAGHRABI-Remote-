@@ -43,21 +43,42 @@ jobs:
         run: |
           Copy-Item agent/agent.config.example.json agent/publish/agent.config.example.json
           @"
-          MAGHRABI Remote Agent V2.1
-          ===========================
+          @echo off
+          chcp 65001 >nul
+          title MAGHRABI Remote Agent V2.1.1
+          cd /d "%~dp0"
+          MAGHRABI-Remote-Agent.exe
+          echo.
+          echo Agent exited with code %ERRORLEVEL%
+          echo.
+          pause
+          "@ | Set-Content -Encoding ASCII agent/publish/RUN-AGENT.bat
 
-          1. Rename agent.config.example.json to agent.config.json
-          2. Put the Railway MAGHRABI_AGENT_TOKEN value in the token field.
-          3. Keep agent.config.json beside MAGHRABI-Remote-Agent.exe
-          4. Run MAGHRABI-Remote-Agent.exe on HOME-PC.
+          @"
+          MAGHRABI Remote Agent V2.1.1
+          =============================
 
-          V2.1 capabilities:
+          Recommended start method:
+          Double-click RUN-AGENT.bat instead of the EXE during testing.
+
+          If agent.config.json is missing, the Agent now creates one automatically
+          and stays open so you can edit it.
+
+          Required configuration:
+          - serverUrl: https://maghrabi-remote-production.up.railway.app
+          - token: same MAGHRABI_AGENT_TOKEN value configured in Railway
+          - displayName: HOME-PC
+          - screenCaptureEnabled: true
+
+          Diagnostics:
+          - The window no longer closes immediately on configuration/runtime errors.
+          - Detailed errors are written to agent.log beside the EXE.
+
+          V2.1.1 capabilities:
           - Device heartbeat / Online status
           - Authenticated view-only primary-screen capture
-          - Screen capture starts only while the owner has an active web session
-          - No mouse or keyboard control in this version
-
-          Railway also requires MAGHRABI_OWNER_PASSWORD before screen viewing is enabled.
+          - Screen capture only during an authenticated owner view session
+          - No mouse or keyboard control yet
           "@ | Set-Content -Encoding UTF8 agent/publish/README-AGENT.txt
 
       - name: Upload Agent artifact
